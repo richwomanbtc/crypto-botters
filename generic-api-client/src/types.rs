@@ -1,2 +1,3 @@
 pub mod event;
-pub mod trade;
+pub mod private;
+pub mod public;

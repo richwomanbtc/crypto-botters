@@ -75,6 +75,10 @@ name = "binance_websocket_private"
 path = "examples/binance/binance_websocket_private.rs"
 
 [[example]]
+name = "binance_websocket_private_future_testnet"
+path = "examples/binance/binance_websocket_private_future_testnet.rs"
+
+[[example]]
 name = "binance_websocket_public"
 path = "examples/binance/binance_websocket_public.rs"
 

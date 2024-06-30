@@ -7,7 +7,11 @@ use generic_api_client::{
     http::*,
     types::{
         event::{Event, MessageEvent},
-        trade::{TradeEvent, TradeSide},
+        private::{
+            BalanceUpdateEvent, OrderSide, OrderStatus, OrderType, OrderUpdateEvent,
+            PositionUpdateEvent,
+        },
+        public::{TradeEvent, TradeSide},
     },
     websocket::*,
 };
@@ -19,6 +23,7 @@ use std::{
     marker::PhantomData,
     str::FromStr,
     time::{Duration, SystemTime},
+    vec,
 };
 
 /// The type returned by [Client::request()].
@@ -156,7 +161,7 @@ pub struct BinanceRequestHandler<'a, R: DeserializeOwned> {
 }
 
 /// A `struct` that implements [WebSocketHandler]
-pub struct BinanceWebSocketHandler<H: FnMut(Event) + Send> {
+pub struct BinanceWebSocketHandler<H: FnMut(Vec<Event>) + Send> {
     event_handler: H,
     options: BinanceOptions,
 }
@@ -275,9 +280,9 @@ where
     }
 }
 
-impl<F> WebSocketHandler for BinanceWebSocketHandler<F>
+impl<H> WebSocketHandler for BinanceWebSocketHandler<H>
 where
-    F: FnMut(Event) + Send + 'static,
+    H: FnMut(Vec<Event>) + Send + 'static,
 {
     fn websocket_config(&self) -> WebSocketConfig {
         let mut config = self.options.websocket_config.clone();
@@ -290,19 +295,40 @@ where
     fn handle_message(&mut self, message: WebSocketMessage) -> Vec<WebSocketMessage> {
         match message {
             WebSocketMessage::Text(message) => {
-                match serde_json::from_str::<BinanceEvent>(&message) {
+                match serde_json::from_str::<BinanceWsEvent>(&message) {
                     Ok(event) => match event {
-                        BinanceEvent::Trade(trade) => {
+                        BinanceWsEvent::Trade(trade) => {
                             let trade = TradeEvent::from(trade);
-                            (self.event_handler)(Event::Trade(trade.into()));
+                            (self.event_handler)(vec![Event::Trade(trade)]);
                         }
-                        BinanceEvent::AggTrade(agg_trade) => {
+                        BinanceWsEvent::AggTrade(agg_trade) => {
                             let trade = TradeEvent::from(agg_trade);
-                            (self.event_handler)(Event::Trade(trade.into()));
+                            (self.event_handler)(vec![Event::Trade(trade)]);
+                        }
+                        BinanceWsEvent::AccountUpdate(account_update) => {
+                            let (position_updates, balance_updates): (
+                                Vec<PositionUpdateEvent>,
+                                Vec<BalanceUpdateEvent>,
+                            ) = account_update.into();
+                            let events: Vec<Vec<Event>> = vec![
+                                position_updates
+                                    .into_iter()
+                                    .map(Event::PositionUpdate)
+                                    .collect(),
+                                balance_updates
+                                    .into_iter()
+                                    .map(Event::BalanceUpdate)
+                                    .collect(),
+                            ];
+                            (self.event_handler)(events.concat());
+                        }
+                        BinanceWsEvent::OrderTradeUpdate(order_trade_update) => {
+                            let order_update = OrderUpdateEvent::from(order_trade_update);
+                            (self.event_handler)(vec![Event::OrderUpdate(order_update)]);
                         }
                     },
-                    Err(e) => {
-                        (self.event_handler)(Event::Message(MessageEvent { message }));
+                    Err(_) => {
+                        (self.event_handler)(vec![Event::Message(MessageEvent { message })]);
                     }
                 }
             }
@@ -406,7 +432,7 @@ where
     }
 }
 
-impl<H: FnMut(Event) + Send + 'static> WebSocketOption<H> for BinanceOption {
+impl<H: FnMut(Vec<Event>) + Send + 'static> WebSocketOption<H> for BinanceOption {
     type WebSocketHandler = BinanceWebSocketHandler<H>;
 
     #[inline(always)]
@@ -429,11 +455,15 @@ impl Default for BinanceOption {
 }
 #[derive(Deserialize)]
 #[serde(tag = "e")]
-enum BinanceEvent {
+enum BinanceWsEvent {
     #[serde(rename = "trade")]
     Trade(BinanceTrade),
     #[serde(rename = "aggTrade")]
     AggTrade(BinanceAggTrade),
+    #[serde(rename = "ACCOUNT_UPDATE")]
+    AccountUpdate(BinanceAccountUpdate),
+    #[serde(rename = "ORDER_TRADE_UPDATE")]
+    OrderTradeUpdate(BinanceOrderTradeUpdate),
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,6 +551,199 @@ impl From<BinanceAggTrade> for TradeEvent {
                 TradeSide::SELL
             } else {
                 TradeSide::BUY
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceAccountUpdate {
+    //{
+    //   "e": "ACCOUNT_UPDATE",                // Event Type
+    //   "E": 1564745798939,                   // Event Time
+    //   "T": 1564745798938 ,                  // Transaction
+    //   "a":                                  // Update Data
+    //     {
+    //       ...
+    //     }
+    // }
+    #[serde(rename = "T", with = "ts_milliseconds")]
+    transaction_timestamp: DateTime<Utc>,
+    #[serde(rename = "a")]
+    update_data: BinanceAccountUpdateData,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceAccountUpdateData {
+    //{
+    //  "m":"ORDER",                      // Event reason type
+    //  "B":[ ... ],                      // Balances
+    //  "P":[ ... ]                        // Positions
+    //}
+    #[serde(rename = "B")]
+    balances: Vec<BinanceBalance>,
+    #[serde(rename = "P")]
+    positions: Vec<BinancePosition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceBalance {
+    //{
+    //  "a":"USDT",                   // Asset
+    //  "wb":"122624.12345678",       // Wallet Balance
+    //  "cw":"100.12345678",          // Cross Wallet Balance
+    //  "bc":"50.12345678"            // Balance Change except PnL and Commission
+    //}
+    #[serde(rename = "a")]
+    asset: String,
+    #[serde(rename = "wb", deserialize_with = "as_f64")]
+    wallet_balance: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinancePosition {
+    //{
+    //  "s":"BTCUSDT",            // Symbol
+    //  "pa":"0",                 // Position Amount
+    //  "ep":"0.00000",           // Entry Price
+    //  "bep":"0",                // breakeven price
+    //  "cr":"200",               // (Pre-fee) Accumulated Realized
+    //  "up":"0",                 // Unrealized PnL
+    //  "mt":"isolated",          // Margin Type
+    //  "iw":"0.00000000",        // Isolated Wallet (if isolated position)
+    //  "ps":"BOTH"               // Position Side
+    //}
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "pa", deserialize_with = "as_f64")]
+    position_amount: f64,
+}
+
+impl From<BinanceAccountUpdate> for (Vec<PositionUpdateEvent>, Vec<BalanceUpdateEvent>) {
+    fn from(value: BinanceAccountUpdate) -> Self {
+        let mut position_updates = Vec::new();
+        let mut balance_updates = Vec::new();
+        for balance in value.update_data.balances {
+            balance_updates.push(BalanceUpdateEvent {
+                timestamp: value.transaction_timestamp,
+                asset: balance.asset,
+                balance: balance.wallet_balance,
+            });
+        }
+        for position in value.update_data.positions {
+            position_updates.push(PositionUpdateEvent {
+                timestamp: value.transaction_timestamp,
+                symbol: position.symbol,
+                position: position.position_amount,
+            });
+        }
+        (position_updates, balance_updates)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceOrderTradeUpdate {
+    // {
+    //   "e":"ORDER_TRADE_UPDATE",     // Event Type
+    //   "E":1568879465651,            // Event Time
+    //   "T":1568879465650,            // Transaction Time
+    //   "o": {...}
+    // }
+    #[serde(rename = "o")]
+    order_trade_update: BinanceOrderTradeUpdateData,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceOrderTradeUpdateData {
+    //{
+    //     "s":"BTCUSDT",              // Symbol
+    //     "c":"TEST",                 // Client Order Id
+    //       // special client order id:
+    //       // starts with "autoclose-": liquidation order
+    //       // "adl_autoclose": ADL auto close order
+    //       // "settlement_autoclose-": settlement order for delisting or delivery
+    //     "S":"SELL",                 // Side
+    //     "o":"TRAILING_STOP_MARKET", // Order Type
+    //     "f":"GTC",                  // Time in Force
+    //     "q":"0.001",                // Original Quantity
+    //     "p":"0",                    // Original Price
+    //     "ap":"0",                   // Average Price
+    //     "sp":"7103.04",             // Stop Price. Please ignore with TRAILING_STOP_MARKET order
+    //     "x":"NEW",                  // Execution Type
+    //     "X":"NEW",                  // Order Status
+    //     "i":8886774,                // Order Id
+    //     "l":"0",                    // Order Last Filled Quantity
+    //     "z":"0",                    // Order Filled Accumulated Quantity
+    //     "L":"0",                    // Last Filled Price
+    //     "N":"USDT",                 // Commission Asset, will not push if no commission
+    //     "n":"0",                    // Commission, will not push if no commission
+    //     "T":1568879465650,          // Order Trade Time
+    //     "t":0,                      // Trade Id
+    //     "b":"0",                    // Bids Notional
+    //     "a":"9.91",                 // Ask Notional
+    //     "m":false,                  // Is this trade the maker side?
+    //     "R":false,                  // Is this reduce only
+    //     "wt":"CONTRACT_PRICE",      // Stop Price Working Type
+    //     "ot":"TRAILING_STOP_MARKET",// Original Order Type
+    //     "ps":"LONG",                // Position Side
+    //     "cp":false,                 // If Close-All, pushed with conditional order
+    //     "AP":"7476.89",             // Activation Price, only puhed with TRAILING_STOP_MARKET order
+    //     "cr":"5.0",                 // Callback Rate, only puhed with TRAILING_STOP_MARKET order
+    //     "pP": false,                // If price protection is turned on
+    //     "si": 0,                    // ignore
+    //     "ss": 0,                    // ignore
+    //     "rp":"0",                   // Realized Profit of the trade
+    //     "V":"EXPIRE_TAKER",         // STP mode
+    //     "pm":"OPPONENT",            // Price match mode
+    //     "gtd":0                     // TIF GTD order auto cancel time
+    //   }
+    //}
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "S")]
+    side: String,
+    #[serde(rename = "o")]
+    order_type: String,
+    #[serde(rename = "q", deserialize_with = "as_f64")]
+    original_quantity: f64,
+    #[serde(rename = "p", deserialize_with = "as_f64")]
+    original_price: f64,
+    #[serde(rename = "X")]
+    order_status: String,
+    #[serde(rename = "i")]
+    order_id: u64,
+    #[serde(rename = "T", with = "ts_milliseconds")]
+    order_trade_time: DateTime<Utc>,
+}
+
+impl From<BinanceOrderTradeUpdate> for OrderUpdateEvent {
+    fn from(order: BinanceOrderTradeUpdate) -> Self {
+        Self {
+            timestamp: order.order_trade_update.order_trade_time,
+            symbol: order.order_trade_update.symbol,
+            order_id: order.order_trade_update.order_id.to_string(),
+            client_order_id: "".to_string(),
+            order_type: match order.order_trade_update.order_type.as_str() {
+                "LIMIT" => OrderType::Limit,
+                "MARKET" => OrderType::Market,
+                "STOP" => OrderType::Stop,
+                "STOP_MARKET" => OrderType::StopLimit,
+                "TAKE_PROFIT" => OrderType::TakeProfit,
+                "TAKE_PROFIT_MARKET" => OrderType::TakeProfitLimit,
+                _ => OrderType::Unknown,
+            },
+            side: match order.order_trade_update.side.as_str() {
+                "BUY" => OrderSide::Buy,
+                "SELL" => OrderSide::Sell,
+                _ => OrderSide::Unknown,
+            },
+            price: order.order_trade_update.original_price,
+            size: order.order_trade_update.original_quantity,
+            status: match order.order_trade_update.order_status.as_str() {
+                "NEW" | "PARTIALLY_FILLED" => OrderStatus::Open,
+                "FILLED" => OrderStatus::Filled,
+                "EXPIRED" | "CANCELED" | "REJECTED" | "EXPIRED_IN_MATCH" => OrderStatus::Expired,
+                _ => OrderStatus::Unknown,
             },
         }
     }
