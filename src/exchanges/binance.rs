@@ -1,15 +1,15 @@
 // A module for communicating with the [Binance API](https://binance-docs.github.io/apidocs/spot/en/).
 
-use std::{
-    str::FromStr,
-    marker::PhantomData,
-    time::{SystemTime, Duration},
-};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use generic_api_client::{http::*, websocket::*};
 use crate::traits::*;
+use generic_api_client::{http::*, websocket::*};
+use hmac::{Hmac, Mac};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::Sha256;
+use std::{
+    marker::PhantomData,
+    str::FromStr,
+    time::{Duration, SystemTime},
+};
 
 /// The type returned by [Client::request()].
 pub type BinanceRequestResult<T> = Result<T, BinanceRequestError>;
@@ -146,8 +146,8 @@ pub struct BinanceRequestHandler<'a, R: DeserializeOwned> {
 }
 
 /// A `struct` that implements [WebSocketHandler]
-pub struct BinanceWebSocketHandler {
-    message_handler: Box<dyn FnMut(serde_json::Value) + Send>,
+pub struct BinanceWebSocketHandler<H: FnMut(serde_json::Value) + Send> {
+    message_handler: H,
     options: BinanceOptions,
 }
 
@@ -169,11 +169,16 @@ where
         config
     }
 
-    fn build_request(&self, mut builder: RequestBuilder, request_body: &Option<B>, _: u8) -> Result<Request, Self::BuildError> {
+    fn build_request(
+        &self,
+        mut builder: RequestBuilder,
+        request_body: &Option<B>,
+        _: u8,
+    ) -> Result<Request, Self::BuildError> {
         if let Some(body) = request_body {
-            let encoded = serde_urlencoded::to_string(body).or(
-                Err("could not serialize body as application/x-www-form-urlencoded"),
-            )?;
+            let encoded = serde_urlencoded::to_string(body).or(Err(
+                "could not serialize body as application/x-www-form-urlencoded",
+            ))?;
             builder = builder
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(encoded);
@@ -185,7 +190,9 @@ where
             builder = builder.header("X-MBX-APIKEY", key);
 
             if self.options.http_auth == BinanceAuth::Sign {
-                let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(); // always after the epoch
+                let time = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap(); // always after the epoch
                 let timestamp = time.as_millis();
 
                 builder = builder.query(&[("timestamp", timestamp)]);
@@ -195,12 +202,18 @@ where
 
                 let mut request = builder.build().or(Err("Failed to build request"))?;
                 let query = request.url().query().unwrap(); // we added the timestamp query
-                let body = request.body().and_then(|body| body.as_bytes()).unwrap_or_default();
+                let body = request
+                    .body()
+                    .and_then(|body| body.as_bytes())
+                    .unwrap_or_default();
 
                 hmac.update(&[query.as_bytes(), body].concat());
                 let signature = hex::encode(hmac.finalize().into_bytes());
 
-                request.url_mut().query_pairs_mut().append_pair("signature", &signature);
+                request
+                    .url_mut()
+                    .query_pairs_mut()
+                    .append_pair("signature", &signature);
 
                 return Ok(request);
             }
@@ -208,7 +221,12 @@ where
         builder.build().or(Err("failed to build request"))
     }
 
-    fn handle_response(&self, status: StatusCode, headers: HeaderMap, response_body: Bytes) -> Result<Self::Successful, Self::Unsuccessful> {
+    fn handle_response(
+        &self,
+        status: StatusCode,
+        headers: HeaderMap,
+        response_body: Bytes,
+    ) -> Result<Self::Successful, Self::Unsuccessful> {
         if status.is_success() {
             serde_json::from_slice(&response_body).map_err(|error| {
                 log::debug!("Failed to parse response due to an error: {}", error);
@@ -247,7 +265,7 @@ where
     }
 }
 
-impl WebSocketHandler for BinanceWebSocketHandler {
+impl<H: FnMut(serde_json::Value) + Send + 'static> WebSocketHandler for BinanceWebSocketHandler<H> {
     fn websocket_config(&self) -> WebSocketConfig {
         let mut config = self.options.websocket_config.clone();
         if self.options.websocket_url != BinanceWebSocketUrl::None {
@@ -264,7 +282,7 @@ impl WebSocketHandler for BinanceWebSocketHandler {
                 } else {
                     log::debug!("Invalid JSON message received");
                 }
-            },
+            }
             WebSocketMessage::Binary(_) => log::debug!("Unexpected binary message received"),
             WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => (),
         }
@@ -366,12 +384,12 @@ where
 }
 
 impl<H: FnMut(serde_json::Value) + Send + 'static> WebSocketOption<H> for BinanceOption {
-    type WebSocketHandler = BinanceWebSocketHandler;
+    type WebSocketHandler = BinanceWebSocketHandler<H>;
 
     #[inline(always)]
     fn websocket_handler(handler: H, options: Self::Options) -> Self::WebSocketHandler {
         BinanceWebSocketHandler {
-            message_handler: Box::new(handler),
+            message_handler: handler,
             options,
         }
     }

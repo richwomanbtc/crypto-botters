@@ -1,17 +1,17 @@
 //! A module for communicating with the [bitFlyer API](https://lightning.bitflyer.com/docs).
 //! For example usages, see files in the examples/ directory.
 
-use std::{
-    marker::PhantomData,
-    time::SystemTime,
+use crate::traits::*;
+use generic_api_client::{
+    http::{header::HeaderValue, *},
+    websocket::*,
 };
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use rand::{Rng, distributions::Alphanumeric};
+use rand::{distributions::Alphanumeric, Rng};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
-use generic_api_client::{http::{*, header::HeaderValue}, websocket::*};
-use crate::traits::*;
+use sha2::Sha256;
+use std::{marker::PhantomData, time::SystemTime};
 
 /// The type returned by [Client::request()].
 pub type BitFlyerRequestResult<T> = Result<T, BitFlyerRequestError>;
@@ -105,8 +105,8 @@ pub struct BitFlyerRequestHandler<'a, R: DeserializeOwned> {
 }
 
 /// A `struct` that implements [WebSocketHandler]
-pub struct BitFlyerWebSocketHandler {
-    message_handler: Box<dyn FnMut(BitFlyerChannelMessage) + Send>,
+pub struct BitFlyerWebSocketHandler<H: FnMut(BitFlyerChannelMessage) + Send> {
+    message_handler: H,
     auth_id: Option<String>,
     options: BitFlyerOptions,
 }
@@ -128,9 +128,15 @@ where
         config
     }
 
-    fn build_request(&self, mut builder: RequestBuilder, request_body: &Option<B>, _: u8) -> Result<Request, Self::BuildError> {
+    fn build_request(
+        &self,
+        mut builder: RequestBuilder,
+        request_body: &Option<B>,
+        _: u8,
+    ) -> Result<Request, Self::BuildError> {
         if let Some(body) = request_body {
-            let json = serde_json::to_vec(body).or(Err("could not serialize body as application/json"))?;
+            let json =
+                serde_json::to_vec(body).or(Err("could not serialize body as application/json"))?;
             builder = builder
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(json);
@@ -140,7 +146,9 @@ where
 
         if self.options.http_auth {
             // https://lightning.bitflyer.com/docs?lang=en#authentication
-            let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(); // always after the epoch
+            let time = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap(); // always after the epoch
             let timestamp = time.as_millis() as u64;
 
             let mut path = request.url().path().to_owned();
@@ -148,7 +156,8 @@ where
                 path.push('?');
                 path.push_str(query)
             }
-            let body = request.body()
+            let body = request
+                .body()
                 .and_then(|body| body.as_bytes())
                 .map(String::from_utf8_lossy)
                 .unwrap_or_default();
@@ -161,20 +170,27 @@ where
             hmac.update(sign_contents.as_bytes());
             let signature = hex::encode(hmac.finalize().into_bytes());
 
-            let key = HeaderValue::from_str(self.options.key.as_deref().ok_or("API key not set")?).or(
-                Err("invalid character in API key")
-            )?;
+            let key = HeaderValue::from_str(self.options.key.as_deref().ok_or("API key not set")?)
+                .or(Err("invalid character in API key"))?;
             let headers = request.headers_mut();
             headers.insert("ACCESS-KEY", key);
             headers.insert("ACCESS-TIMESTAMP", HeaderValue::from(timestamp));
             headers.insert("ACCESS-SIGN", HeaderValue::from_str(&signature).unwrap()); // hex digits are valid
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str("application/json").unwrap()); // only contains valid letters
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str("application/json").unwrap(),
+            ); // only contains valid letters
         }
 
         Ok(request)
     }
 
-    fn handle_response(&self, status: StatusCode, _: HeaderMap, response_body: Bytes) -> Result<Self::Successful, Self::Unsuccessful> {
+    fn handle_response(
+        &self,
+        status: StatusCode,
+        _: HeaderMap,
+        response_body: Bytes,
+    ) -> Result<Self::Successful, Self::Unsuccessful> {
         if status.is_success() {
             serde_json::from_slice(&response_body).map_err(|error| {
                 log::debug!("Failed to parse response due to an error: {}", error);
@@ -193,7 +209,9 @@ where
     }
 }
 
-impl WebSocketHandler for BitFlyerWebSocketHandler {
+impl<H: FnMut(BitFlyerChannelMessage) + Send + 'static> WebSocketHandler
+    for BitFlyerWebSocketHandler<H>
+{
     fn websocket_config(&self) -> WebSocketConfig {
         let mut config = self.options.websocket_config.clone();
         if self.options.websocket_url != BitFlyerWebSocketUrl::None {
@@ -207,7 +225,9 @@ impl WebSocketHandler for BitFlyerWebSocketHandler {
             // https://bf-lightning-api.readme.io/docs/realtime-api-auth
             if let Some(key) = self.options.key.as_deref() {
                 if let Some(secret) = self.options.secret.as_deref() {
-                    let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(); // always after the epoch
+                    let time = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap(); // always after the epoch
                     let timestamp = time.as_millis() as u64;
                     let nonce: String = rand::thread_rng()
                         .sample_iter(&Alphanumeric)
@@ -223,16 +243,19 @@ impl WebSocketHandler for BitFlyerWebSocketHandler {
                     let id = format!("_auth{}", time.as_nanos());
                     self.auth_id = Some(id.clone());
 
-                    return vec![WebSocketMessage::Text(json!({
-                        "method": "auth",
-                        "params": {
-                            "api_key": key,
-                            "timestamp": timestamp,
-                            "nonce": nonce,
-                            "signature": signature,
-                        },
-                        "id": id,
-                    }).to_string())];
+                    return vec![WebSocketMessage::Text(
+                        json!({
+                            "method": "auth",
+                            "params": {
+                                "api_key": key,
+                                "timestamp": timestamp,
+                                "nonce": nonce,
+                                "signature": signature,
+                            },
+                            "id": id,
+                        })
+                        .to_string(),
+                    )];
                 } else {
                     log::debug!("API secret not set.");
                 };
@@ -261,7 +284,7 @@ impl WebSocketHandler for BitFlyerWebSocketHandler {
                     Err(_) => {
                         log::debug!("Invalid JSON-RPC message received");
                         return vec![];
-                    },
+                    }
                 };
                 if self.options.websocket_auth && self.auth_id == message.id {
                     // result of auth
@@ -277,7 +300,7 @@ impl WebSocketHandler for BitFlyerWebSocketHandler {
                         (self.message_handler)(channel_message);
                     }
                 }
-            },
+            }
             WebSocketMessage::Binary(_) => log::debug!("Unexpected binary message received"),
             WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => (),
         }
@@ -285,12 +308,19 @@ impl WebSocketHandler for BitFlyerWebSocketHandler {
     }
 }
 
-impl BitFlyerWebSocketHandler {
+impl<H: FnMut(BitFlyerChannelMessage) + Send> BitFlyerWebSocketHandler<H> {
     #[inline]
     fn message_subscribe(&self) -> Vec<WebSocketMessage> {
-        self.options.websocket_channels.clone().into_iter().map(|channel| {
-            WebSocketMessage::Text(json!({ "method": "subscribe", "params": { "channel": channel } }).to_string())
-        }).collect()
+        self.options
+            .websocket_channels
+            .clone()
+            .into_iter()
+            .map(|channel| {
+                WebSocketMessage::Text(
+                    json!({ "method": "subscribe", "params": { "channel": channel } }).to_string(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -370,12 +400,12 @@ where
 }
 
 impl<H: FnMut(BitFlyerChannelMessage) + Send + 'static> WebSocketOption<H> for BitFlyerOption {
-    type WebSocketHandler = BitFlyerWebSocketHandler;
+    type WebSocketHandler = BitFlyerWebSocketHandler<H>;
 
     #[inline(always)]
     fn websocket_handler(handler: H, options: Self::Options) -> Self::WebSocketHandler {
         BitFlyerWebSocketHandler {
-            message_handler: Box::new(handler),
+            message_handler: handler,
             auth_id: None,
             options,
         }

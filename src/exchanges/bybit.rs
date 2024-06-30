@@ -1,13 +1,16 @@
 //! A module for communicating with the [Bybit API](https://bybit-exchange.github.io/docs/spot/v3/#t-introduction).
 //! For example usages, see files in the examples/ directory.
 
-use std::{time::SystemTime, borrow::Cow, marker::PhantomData, vec};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use serde::{Serialize, de::DeserializeOwned};
-use serde_json::json;
-use generic_api_client::{http::{*, header::HeaderValue}, websocket::*};
 use crate::traits::*;
+use generic_api_client::{
+    http::{header::HeaderValue, *},
+    websocket::*,
+};
+use hmac::{Hmac, Mac};
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::json;
+use sha2::Sha256;
+use std::{borrow::Cow, marker::PhantomData, time::SystemTime, vec};
 
 /// The type returned by [Client::request()].
 pub type BybitRequestResult<T> = Result<T, BybitRequestError>;
@@ -124,8 +127,8 @@ pub struct BybitRequestHandler<'a, R: DeserializeOwned> {
     _phantom: PhantomData<&'a R>,
 }
 
-pub struct BybitWebSocketHandler {
-    message_handler: Box<dyn FnMut(serde_json::Value) + Send>,
+pub struct BybitWebSocketHandler<H: FnMut(serde_json::Value) + Send> {
+    message_handler: H,
     options: BybitOptions,
 }
 
@@ -146,10 +149,16 @@ where
         config
     }
 
-    fn build_request(&self, mut builder: RequestBuilder, request_body: &Option<B>, _: u8) -> Result<Request, Self::BuildError> {
+    fn build_request(
+        &self,
+        mut builder: RequestBuilder,
+        request_body: &Option<B>,
+        _: u8,
+    ) -> Result<Request, Self::BuildError> {
         if self.options.http_auth == BybitHttpAuth::None {
             if let Some(body) = request_body {
-                let json = serde_json::to_string(body).or(Err("could not serialize body as application/json"))?;
+                let json = serde_json::to_string(body)
+                    .or(Err("could not serialize body as application/json"))?;
                 builder = builder
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(json);
@@ -160,21 +169,60 @@ where
         let key = self.options.key.as_deref().ok_or("API key not set")?;
         let secret = self.options.secret.as_deref().ok_or("API secret not set")?;
 
-        let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(); // always after the epoch
+        let time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap(); // always after the epoch
         let timestamp = time.as_millis();
 
         let hmac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap(); // hmac accepts key of any length
 
         match self.options.http_auth {
-            BybitHttpAuth::SpotV1 => Self::v1_auth(builder, request_body, key, timestamp, hmac, true, self.options.recv_window),
-            BybitHttpAuth::BelowV3 => Self::v1_auth(builder, request_body, key, timestamp, hmac, false, self.options.recv_window),
-            BybitHttpAuth::UsdcContractV1 => Self::v3_auth(builder, request_body, key, timestamp, hmac, true, self.options.recv_window),
-            BybitHttpAuth::V3AndAbove => Self::v3_auth(builder, request_body, key, timestamp, hmac, false, self.options.recv_window),
+            BybitHttpAuth::SpotV1 => Self::v1_auth(
+                builder,
+                request_body,
+                key,
+                timestamp,
+                hmac,
+                true,
+                self.options.recv_window,
+            ),
+            BybitHttpAuth::BelowV3 => Self::v1_auth(
+                builder,
+                request_body,
+                key,
+                timestamp,
+                hmac,
+                false,
+                self.options.recv_window,
+            ),
+            BybitHttpAuth::UsdcContractV1 => Self::v3_auth(
+                builder,
+                request_body,
+                key,
+                timestamp,
+                hmac,
+                true,
+                self.options.recv_window,
+            ),
+            BybitHttpAuth::V3AndAbove => Self::v3_auth(
+                builder,
+                request_body,
+                key,
+                timestamp,
+                hmac,
+                false,
+                self.options.recv_window,
+            ),
             BybitHttpAuth::None => unreachable!(), // we've already handled this case
         }
     }
 
-    fn handle_response(&self, status: StatusCode, _: HeaderMap, response_body: Bytes) -> Result<Self::Successful, Self::Unsuccessful> {
+    fn handle_response(
+        &self,
+        status: StatusCode,
+        _: HeaderMap,
+        response_body: Bytes,
+    ) -> Result<Self::Successful, Self::Unsuccessful> {
         if status.is_success() {
             serde_json::from_slice(&response_body).map_err(|error| {
                 log::debug!("Failed to parse response due to an error: {}", error);
@@ -193,22 +241,39 @@ where
                 Err(error) => {
                     log::debug!("Failed to parse error response due to an error: {}", error);
                     BybitHandlerError::ParseError
-                },
+                }
             };
             Err(error)
         }
     }
 }
 
-impl<'a, R> BybitRequestHandler<'a, R> where R: DeserializeOwned {
-    fn v1_auth<B>(builder: RequestBuilder, request_body: &Option<B>, key: &str, timestamp: u128, mut hmac: Hmac<Sha256>, spot: bool, window: Option<i32>)
-        -> Result<Request, <BybitRequestHandler<'a, R> as RequestHandler<B>>::BuildError>
+impl<'a, R> BybitRequestHandler<'a, R>
+where
+    R: DeserializeOwned,
+{
+    fn v1_auth<B>(
+        builder: RequestBuilder,
+        request_body: &Option<B>,
+        key: &str,
+        timestamp: u128,
+        mut hmac: Hmac<Sha256>,
+        spot: bool,
+        window: Option<i32>,
+    ) -> Result<Request, <BybitRequestHandler<'a, R> as RequestHandler<B>>::BuildError>
     where
         B: Serialize,
     {
-        fn sort_and_add<'a>(mut pairs: Vec<(Cow<str>, Cow<'a, str>)>, key: &'a str, timestamp: u128) -> String {
+        fn sort_and_add<'a>(
+            mut pairs: Vec<(Cow<str>, Cow<'a, str>)>,
+            key: &'a str,
+            timestamp: u128,
+        ) -> String {
             pairs.push((Cow::Borrowed("api_key"), Cow::Borrowed(key)));
-            pairs.push((Cow::Borrowed("timestamp"), Cow::Owned(timestamp.to_string())));
+            pairs.push((
+                Cow::Borrowed("timestamp"),
+                Cow::Owned(timestamp.to_string()),
+            ));
             pairs.sort_unstable();
 
             let mut urlencoded = String::new();
@@ -240,22 +305,36 @@ impl<'a, R> BybitRequestHandler<'a, R> where R: DeserializeOwned {
             hmac.update(query.as_bytes());
             let signature = hex::encode(hmac.finalize().into_bytes());
 
-            request.url_mut().query_pairs_mut().append_pair("sign", &signature);
+            request
+                .url_mut()
+                .query_pairs_mut()
+                .append_pair("sign", &signature);
 
             if let Some(body) = request_body {
                 if spot {
-                    let body_string = serde_urlencoded::to_string(body).or(Err("could not serialize body as application/x-www-form-urlencoded"))?;
+                    let body_string = serde_urlencoded::to_string(body).or(Err(
+                        "could not serialize body as application/x-www-form-urlencoded",
+                    ))?;
                     *request.body_mut() = Some(body_string.into());
-                    request.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+                    request.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/x-www-form-urlencoded"),
+                    );
                 } else {
-                    let body_string = serde_json::to_string(body).or(Err("could not serialize body as application/json"))?;
+                    let body_string = serde_json::to_string(body)
+                        .or(Err("could not serialize body as application/json"))?;
                     *request.body_mut() = Some(body_string.into());
-                    request.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    request.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
                 }
             }
         } else {
             let mut body = if let Some(body) = request_body {
-                serde_urlencoded::to_string(body).or(Err("could not serialize body as application/x-www-form-urlencoded"))?
+                serde_urlencoded::to_string(body).or(Err(
+                    "could not serialize body as application/x-www-form-urlencoded",
+                ))?
             } else {
                 String::new()
             };
@@ -271,7 +350,8 @@ impl<'a, R> BybitRequestHandler<'a, R> where R: DeserializeOwned {
                 body.push_str(&window.to_string());
             }
 
-            let pairs: Vec<_> = body.split('&')
+            let pairs: Vec<_> = body
+                .split('&')
                 .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
                 .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
                 .collect();
@@ -284,23 +364,38 @@ impl<'a, R> BybitRequestHandler<'a, R> where R: DeserializeOwned {
 
             if spot {
                 *request.body_mut() = Some(sorted_query_string.into());
-                request.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+                request.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-www-form-urlencoded"),
+                );
             } else {
-                let body: serde_json::Value = serde_urlencoded::from_str(&sorted_query_string).unwrap(); // sorted_query_string is always in urlencoded format
+                let body: serde_json::Value =
+                    serde_urlencoded::from_str(&sorted_query_string).unwrap(); // sorted_query_string is always in urlencoded format
                 *request.body_mut() = Some(body.to_string().into());
-                request.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                request.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
             }
         }
         Ok(request)
     }
 
-    fn v3_auth<B>(mut builder: RequestBuilder, request_body: &Option<B>, key: &str, timestamp: u128, mut hmac: Hmac<Sha256>, version_header: bool, window: Option<i32>)
-        -> Result<Request, <BybitRequestHandler<'a, R> as RequestHandler<B>>::BuildError>
+    fn v3_auth<B>(
+        mut builder: RequestBuilder,
+        request_body: &Option<B>,
+        key: &str,
+        timestamp: u128,
+        mut hmac: Hmac<Sha256>,
+        version_header: bool,
+        window: Option<i32>,
+    ) -> Result<Request, <BybitRequestHandler<'a, R> as RequestHandler<B>>::BuildError>
     where
         B: Serialize,
     {
         let body = if let Some(body) = request_body {
-            let json = serde_json::to_value(body).or(Err("could not serialize body as application/json"))?;
+            let json = serde_json::to_value(body)
+                .or(Err("could not serialize body as application/json"))?;
             builder = builder
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(json.to_string());
@@ -323,7 +418,10 @@ impl<'a, R> BybitRequestHandler<'a, R> where R: DeserializeOwned {
         } else {
             let body = body.unwrap_or_else(|| {
                 *request.body_mut() = Some("{}".into());
-                request.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                request.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
                 json!({})
             });
             sign_contents.push_str(&body.to_string());
@@ -337,7 +435,10 @@ impl<'a, R> BybitRequestHandler<'a, R> where R: DeserializeOwned {
             headers.insert("X-BAPI-SIGN-TYPE", HeaderValue::from(2));
         }
         headers.insert("X-BAPI-SIGN", HeaderValue::from_str(&signature).unwrap()); // hex digits are valid
-        headers.insert("X-BAPI-API-KEY", HeaderValue::from_str(key).or(Err("invalid character in API key"))?);
+        headers.insert(
+            "X-BAPI-API-KEY",
+            HeaderValue::from_str(key).or(Err("invalid character in API key"))?,
+        );
         headers.insert("X-BAPI-TIMESTAMP", HeaderValue::from(timestamp as u64));
         if let Some(window) = window {
             headers.insert("X-BAPI-RECV-WINDOW", HeaderValue::from(window));
@@ -346,7 +447,7 @@ impl<'a, R> BybitRequestHandler<'a, R> where R: DeserializeOwned {
     }
 }
 
-impl WebSocketHandler for BybitWebSocketHandler {
+impl<H: FnMut(serde_json::Value) + Send + 'static> WebSocketHandler for BybitWebSocketHandler<H> {
     fn websocket_config(&self) -> WebSocketConfig {
         let mut config = self.options.websocket_config.clone();
         if self.options.websocket_url != BybitWebSocketUrl::None {
@@ -359,7 +460,9 @@ impl WebSocketHandler for BybitWebSocketHandler {
         if self.options.websocket_auth {
             if let Some(key) = self.options.key.as_deref() {
                 if let Some(secret) = self.options.secret.as_deref() {
-                    let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(); // always after the epoch
+                    let time = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap(); // always after the epoch
                     let expires = time.as_millis() as u64 + 1000;
 
                     let mut hmac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap(); // hmac accepts key of any length
@@ -367,12 +470,13 @@ impl WebSocketHandler for BybitWebSocketHandler {
                     hmac.update(format!("GET/realtime{expires}").as_bytes());
                     let signature = hex::encode(hmac.finalize().into_bytes());
 
-                    return vec![
-                        WebSocketMessage::Text(json!({
+                    return vec![WebSocketMessage::Text(
+                        json!({
                             "op": "auth",
                             "args": [key, expires, signature],
-                        }).to_string()),
-                    ];
+                        })
+                        .to_string(),
+                    )];
                 } else {
                     log::debug!("API secret not set.");
                 };
@@ -391,27 +495,33 @@ impl WebSocketHandler for BybitWebSocketHandler {
                     Err(_) => {
                         log::debug!("Invalid JSON received");
                         return vec![];
-                    },
+                    }
                 };
                 match message["op"].as_str() {
                     Some("auth") => {
                         if message["success"].as_bool() == Some(true) {
                             log::debug!("WebSocket authentication successful");
                         } else {
-                            log::debug!("WebSocket authentication unsuccessful; message: {}", message["ret_msg"]);
+                            log::debug!(
+                                "WebSocket authentication unsuccessful; message: {}",
+                                message["ret_msg"]
+                            );
                         }
                         return self.message_subscribe();
-                    },
+                    }
                     Some("subscribe") => {
                         if message["success"].as_bool() == Some(true) {
                             log::debug!("WebSocket topics subscription successful");
                         } else {
-                            log::debug!("WebSocket topics subscription unsuccessful; message: {}", message["ret_msg"]);
+                            log::debug!(
+                                "WebSocket topics subscription unsuccessful; message: {}",
+                                message["ret_msg"]
+                            );
                         }
-                    },
+                    }
                     _ => (self.message_handler)(message),
                 }
-            },
+            }
             WebSocketMessage::Binary(_) => log::debug!("Unexpected binary message received"),
             WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => (),
         }
@@ -419,7 +529,7 @@ impl WebSocketHandler for BybitWebSocketHandler {
     }
 }
 
-impl BybitWebSocketHandler {
+impl<H: FnMut(serde_json::Value) + Send> BybitWebSocketHandler<H> {
     #[inline(always)]
     fn message_subscribe(&self) -> Vec<WebSocketMessage> {
         vec![WebSocketMessage::Text(
@@ -509,13 +619,13 @@ where
     }
 }
 
-impl <H: FnMut(serde_json::Value) + Send + 'static> WebSocketOption<H> for BybitOption {
-    type WebSocketHandler = BybitWebSocketHandler;
+impl<H: FnMut(serde_json::Value) + Send + 'static> WebSocketOption<H> for BybitOption {
+    type WebSocketHandler = BybitWebSocketHandler<H>;
 
     #[inline(always)]
     fn websocket_handler(handler: H, options: Self::Options) -> Self::WebSocketHandler {
         BybitWebSocketHandler {
-            message_handler: Box::new(handler),
+            message_handler: handler,
             options,
         }
     }
