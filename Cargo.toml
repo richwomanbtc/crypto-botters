@@ -12,7 +12,12 @@ homepage = "https://github.com/negi-grass/crypto-botters"
 documentation = "https://docs.rs/crypto-botters"
 repository = "https://github.com/negi-grass/crypto-botters"
 keywords = ["cryptocurrency", "finance", "trading", "client", "websocket"]
-categories = ["api-bindings", "asynchronous", "cryptography::cryptocurrencies", "authentication"]
+categories = [
+    "api-bindings",
+    "asynchronous",
+    "cryptography::cryptocurrencies",
+    "authentication",
+]
 autoexamples = false
 exclude = ["/.idea", "/.github"]
 
@@ -44,11 +49,17 @@ hex = "0.4.3"
 log = "0.4.20"
 serde_urlencoded = { version = "0.7.1", optional = true }
 rand = { version = "0.8.5", optional = true }
+anyhow = "1.0.86"
+chrono = { version = "0.4.38", features = ["serde"] }
+serde-this-or-that = "0.4.2"
 
 [dev-dependencies]
 crypto-botters = { path = ".", features = ["full"] }
 tokio = { version = "1.34.0", features = ["rt-multi-thread", "macros"] }
-rust_decimal = { version = "1.33.0", features = ["serde-with-str", "serde-with-float"] }
+rust_decimal = { version = "1.33.0", features = [
+    "serde-with-str",
+    "serde-with-float",
+] }
 env_logger = "0.10.1"
 
 [[example]]

@@ -1,12 +1,9 @@
-use std::{
-    env,
-    time::Duration,
+use crypto_botters::{
+    binance::{BinanceAuth, BinanceHttpUrl, BinanceOption, BinanceWebSocketUrl},
+    Client,
 };
 use log::LevelFilter;
-use crypto_botters::{
-    Client,
-    binance::{BinanceOption, BinanceWebSocketUrl, BinanceHttpUrl, BinanceAuth},
-};
+use std::{env, time::Duration};
 
 #[tokio::main]
 async fn main() {
@@ -19,17 +16,26 @@ async fn main() {
     client.update_default_option(BinanceOption::Key(key));
     client.update_default_option(BinanceOption::Secret(secret));
 
-    let key: serde_json::Value = client.post(
-        "/sapi/v1/userDataStream/isolated",
-        Some(&[("symbol", "BTCUSDT")]),
-        [BinanceOption::HttpAuth(BinanceAuth::Key), BinanceOption::HttpUrl(BinanceHttpUrl::Spot)],
-    ).await.expect("failed to get listen key");
+    let key: serde_json::Value = client
+        .post(
+            "/sapi/v1/userDataStream/isolated",
+            Some(&[("symbol", "BTCUSDT")]),
+            [
+                BinanceOption::HttpAuth(BinanceAuth::Key),
+                BinanceOption::HttpUrl(BinanceHttpUrl::Spot),
+            ],
+        )
+        .await
+        .expect("failed to get listen key");
 
-    let _connection = client.websocket(
-        &format!("/ws/{}", key["listenKey"].as_str().unwrap()),
-        |message| println!("{}", message),
-        [BinanceOption::WebSocketUrl(BinanceWebSocketUrl::Spot9443)],
-    ).await.expect("failed to connect websocket");
+    let _connection = client
+        .websocket(
+            &format!("/ws/{}", key["listenKey"].as_str().unwrap()),
+            |message| println!("{:?}", message),
+            [BinanceOption::WebSocketUrl(BinanceWebSocketUrl::Spot9443)],
+        )
+        .await
+        .expect("failed to connect websocket");
 
     // receive messages
     tokio::time::sleep(Duration::from_secs(60)).await;

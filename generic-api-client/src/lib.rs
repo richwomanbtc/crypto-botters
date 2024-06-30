@@ -7,7 +7,7 @@
     rust_2018_idioms,
     rust_2021_compatibility,
     unused,
-    missing_docs,
+    missing_docs
 )]
 
 //! # Generic-API-Client
@@ -25,5 +25,7 @@
 
 /// Module for interacting with HTTP/HTTPS APIs.
 pub mod http;
+/// Module for unified data structures.
+pub mod types;
 /// Module for interacting with WebSocket APIs.
 pub mod websocket;

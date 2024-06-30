@@ -1,15 +1,25 @@
 // A module for communicating with the [Binance API](https://binance-docs.github.io/apidocs/spot/en/).
 
-use std::{
-    str::FromStr,
-    marker::PhantomData,
-    time::{SystemTime, Duration},
+use crate::traits::*;
+use anyhow::{format_err, Error, Result};
+use chrono::{serde::ts_milliseconds, DateTime, Utc};
+use generic_api_client::{
+    http::*,
+    types::{
+        event::{ErrorEvent, Event},
+        trade::{TradeEvent, TradeSide},
+    },
+    websocket::*,
 };
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use generic_api_client::{http::*, websocket::*};
-use crate::traits::*;
+use serde_this_or_that::as_f64;
+use sha2::Sha256;
+use std::{
+    marker::PhantomData,
+    str::FromStr,
+    time::{Duration, SystemTime},
+};
 
 /// The type returned by [Client::request()].
 pub type BinanceRequestResult<T> = Result<T, BinanceRequestError>;
@@ -147,7 +157,7 @@ pub struct BinanceRequestHandler<'a, R: DeserializeOwned> {
 
 /// A `struct` that implements [WebSocketHandler]
 pub struct BinanceWebSocketHandler {
-    message_handler: Box<dyn FnMut(serde_json::Value) + Send>,
+    event_handler: Box<dyn FnMut(Event) + Send>,
     options: BinanceOptions,
 }
 
@@ -169,11 +179,16 @@ where
         config
     }
 
-    fn build_request(&self, mut builder: RequestBuilder, request_body: &Option<B>, _: u8) -> Result<Request, Self::BuildError> {
+    fn build_request(
+        &self,
+        mut builder: RequestBuilder,
+        request_body: &Option<B>,
+        _: u8,
+    ) -> Result<Request, Self::BuildError> {
         if let Some(body) = request_body {
-            let encoded = serde_urlencoded::to_string(body).or(
-                Err("could not serialize body as application/x-www-form-urlencoded"),
-            )?;
+            let encoded = serde_urlencoded::to_string(body).or(Err(
+                "could not serialize body as application/x-www-form-urlencoded",
+            ))?;
             builder = builder
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(encoded);
@@ -185,7 +200,9 @@ where
             builder = builder.header("X-MBX-APIKEY", key);
 
             if self.options.http_auth == BinanceAuth::Sign {
-                let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(); // always after the epoch
+                let time = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap(); // always after the epoch
                 let timestamp = time.as_millis();
 
                 builder = builder.query(&[("timestamp", timestamp)]);
@@ -195,12 +212,18 @@ where
 
                 let mut request = builder.build().or(Err("Failed to build request"))?;
                 let query = request.url().query().unwrap(); // we added the timestamp query
-                let body = request.body().and_then(|body| body.as_bytes()).unwrap_or_default();
+                let body = request
+                    .body()
+                    .and_then(|body| body.as_bytes())
+                    .unwrap_or_default();
 
                 hmac.update(&[query.as_bytes(), body].concat());
                 let signature = hex::encode(hmac.finalize().into_bytes());
 
-                request.url_mut().query_pairs_mut().append_pair("signature", &signature);
+                request
+                    .url_mut()
+                    .query_pairs_mut()
+                    .append_pair("signature", &signature);
 
                 return Ok(request);
             }
@@ -208,7 +231,12 @@ where
         builder.build().or(Err("failed to build request"))
     }
 
-    fn handle_response(&self, status: StatusCode, headers: HeaderMap, response_body: Bytes) -> Result<Self::Successful, Self::Unsuccessful> {
+    fn handle_response(
+        &self,
+        status: StatusCode,
+        headers: HeaderMap,
+        response_body: Bytes,
+    ) -> Result<Self::Successful, Self::Unsuccessful> {
         if status.is_success() {
             serde_json::from_slice(&response_body).map_err(|error| {
                 log::debug!("Failed to parse response due to an error: {}", error);
@@ -259,12 +287,23 @@ impl WebSocketHandler for BinanceWebSocketHandler {
     fn handle_message(&mut self, message: WebSocketMessage) -> Vec<WebSocketMessage> {
         match message {
             WebSocketMessage::Text(message) => {
-                if let Ok(message) = serde_json::from_str(&message) {
-                    (self.message_handler)(message);
-                } else {
-                    log::debug!("Invalid JSON message received");
+                match serde_json::from_str::<BinanceEvent>(&message) {
+                    Ok(event) => match event {
+                        BinanceEvent::Trade(trade) => {
+                            let trade = TradeEvent::from(trade);
+                            (self.event_handler)(Event::Trade(trade.into()));
+                        }
+                        BinanceEvent::AggTrade(agg_trade) => {
+                            let trade = TradeEvent::from(agg_trade);
+                            (self.event_handler)(Event::Trade(trade.into()));
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("Failed to parse message: {:?}", e);
+                        (self.event_handler)(Event::Error(ErrorEvent { message }));
+                    }
                 }
-            },
+            }
             WebSocketMessage::Binary(_) => log::debug!("Unexpected binary message received"),
             WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => (),
         }
@@ -365,13 +404,13 @@ where
     }
 }
 
-impl<H: FnMut(serde_json::Value) + Send + 'static> WebSocketOption<H> for BinanceOption {
+impl<H: FnMut(Event) + Send + 'static> WebSocketOption<H> for BinanceOption {
     type WebSocketHandler = BinanceWebSocketHandler;
 
     #[inline(always)]
     fn websocket_handler(handler: H, options: Self::Options) -> Self::WebSocketHandler {
         BinanceWebSocketHandler {
-            message_handler: Box::new(handler),
+            event_handler: Box::new(handler),
             options,
         }
     }
@@ -384,5 +423,103 @@ impl HandlerOption for BinanceOption {
 impl Default for BinanceOption {
     fn default() -> Self {
         Self::Default
+    }
+}
+#[derive(Deserialize)]
+#[serde(tag = "e")]
+enum BinanceEvent {
+    #[serde(rename = "trade")]
+    Trade(BinanceTrade),
+    #[serde(rename = "aggTrade")]
+    AggTrade(BinanceAggTrade),
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceTrade {
+    // {
+    //   "e": "trade",     // Event type
+    //   "E": 1672515782136,   // Event time
+    //   "s": "BNBBTC",    // Symbol
+    //   "t": 12345,       // Trade ID
+    //   "p": "0.001",     // Price
+    //   "q": "100",       // Quantity
+    //   "T": 1672515782136,   // Trade time
+    //   "m": true,        // Is the buyer the market maker?
+    //   "M": true         // Ignore
+    // }
+    #[serde(rename = "T", with = "ts_milliseconds")]
+    trade_time: DateTime<Utc>,
+    #[serde(rename = "m")]
+    is_buyer_maker: bool,
+    #[serde(rename = "p", deserialize_with = "as_f64")]
+    price: f64,
+    #[serde(rename = "q", deserialize_with = "as_f64")]
+    quantity: f64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "t")]
+    trade_id: u64,
+}
+
+impl From<BinanceTrade> for TradeEvent {
+    fn from(trade: BinanceTrade) -> Self {
+        Self {
+            timestamp: trade.trade_time,
+            symbol: trade.symbol,
+            price: trade.price,
+            size: trade.quantity,
+            trade_id: Some(trade.trade_id),
+            side: if trade.is_buyer_maker {
+                TradeSide::SELL
+            } else {
+                TradeSide::BUY
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceAggTrade {
+    // {
+    //   "e": "aggTrade",  // Event type
+    //   "E": 1672515782136,   // Event time
+    //   "s": "BNBBTC",    // Symbol
+    //   "a": 12345,       // Aggregate trade ID
+    //   "p": "0.001",     // Price
+    //   "q": "100",       // Quantity
+    //   "f": 100,         // First trade ID
+    //   "l": 105,         // Last trade ID
+    //   "T": 1672515782136,   // Trade time
+    //   "m": true,        // Is the buyer the market maker?
+    //   "M": true         // Ignore
+    // }
+    #[serde(rename = "T", with = "ts_milliseconds")]
+    trade_time: DateTime<Utc>,
+    #[serde(rename = "m")]
+    is_buyer_maker: bool,
+    #[serde(rename = "p", deserialize_with = "as_f64")]
+    price: f64,
+    #[serde(rename = "q", deserialize_with = "as_f64")]
+    quantity: f64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "a")]
+    trade_id: u64,
+}
+
+impl From<BinanceAggTrade> for TradeEvent {
+    fn from(trade: BinanceAggTrade) -> Self {
+        Self {
+            timestamp: trade.trade_time,
+            symbol: trade.symbol,
+            price: trade.price,
+            size: trade.quantity,
+            trade_id: Some(trade.trade_id),
+            side: if trade.is_buyer_maker {
+                TradeSide::SELL
+            } else {
+                TradeSide::BUY
+            },
+        }
     }
 }

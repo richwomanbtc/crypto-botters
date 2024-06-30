@@ -22,6 +22,9 @@ parking_lot = "0.12.1"
 bytes = "1.5.0"
 log = "0.4.20"
 thiserror = "1.0.50"
+chrono = "0.4.38"
+anyhow = "1.0.86"
+regex = "1.10.5"
 
 [features]
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
