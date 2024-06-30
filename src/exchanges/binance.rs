@@ -1,12 +1,12 @@
 // A module for communicating with the [Binance API](https://binance-docs.github.io/apidocs/spot/en/).
 
 use crate::traits::*;
-use anyhow::{format_err, Error, Result};
+use anyhow::Result;
 use chrono::{serde::ts_milliseconds, DateTime, Utc};
 use generic_api_client::{
     http::*,
     types::{
-        event::{ErrorEvent, Event},
+        event::{Event, MessageEvent},
         trade::{TradeEvent, TradeSide},
     },
     websocket::*,
@@ -302,8 +302,7 @@ where
                         }
                     },
                     Err(e) => {
-                        log::error!("Failed to parse message: {:?}", e);
-                        (self.event_handler)(Event::Error(ErrorEvent { message }));
+                        (self.event_handler)(Event::Message(MessageEvent { message }));
                     }
                 }
             }
